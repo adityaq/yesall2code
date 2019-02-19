@@ -1,0 +1,223 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS.h>
+#define PIN_GATE_IN 2
+#define PIN_ANALOG_IN A0
+#define NB_SAMPLE   10
+#define LEDPIN D4
+SoftwareSerial Gps(D6, D7);
+TinyGPS gps;
+void gpsdump(TinyGPS &gps);
+void printFloat(double f, int digits = 2);
+
+long accelX, accelY, accelZ;
+float gForceX, gForceY, gForceZ;
+long gyroX, gyroY, gyroZ;
+float rotX, rotY, rotZ;
+const char* ssid     = "Novaders"; // Your ssid
+const char* password = "Tricons@123"; // Your Password 
+const char* mqtt_server = "192.168.1.6"; //Mqtt Ip
+WiFiClient espClient;
+PubSubClient client(espClient);
+void setupMPU(){
+    Wire.beginTransmission(0b1101000); //This is the I2C address of the MPU (b1101000/b1101001 for AC0 low/high datasheet sec. 9.2)
+    Wire.write(0x6B); //Accessing the register 6B - Power Management (Sec. 4.28)
+    Wire.write(0b00000000); //Setting SLEEP register to 0. (Required; see Note on p. 9)
+    Wire.endTransmission();  
+    Wire.beginTransmission(0b1101000); //I2C address of the MPU
+    Wire.write(0x1B); //Accessing the register 1B - Gyroscope Configuration (Sec. 4.4) 
+    Wire.write(0x00000000); //Setting the gyro to full scale +/- 250deg./s 
+    Wire.endTransmission(); 
+    Wire.beginTransmission(0b1101000); //I2C address of the MPU
+    Wire.write(0x1C); //Accessing the register 1C - Acccelerometer Configuration (Sec. 4.5) 
+    Wire.write(0b00000000); //Setting the accel to +/- 2g
+    Wire.endTransmission(); }
+void recordAccelRegisters() {
+    Wire.beginTransmission(0b1101000); //I2C address of the MPU
+    Wire.write(0x3B); //Starting register for Accel Readings
+    Wire.endTransmission();
+    Wire.requestFrom(0b1101000,6); //Request Accel Registers (3B - 40)
+    while(Wire.available() < 6);
+    accelX = Wire.read()<<8|Wire.read(); //Store first two bytes into accelX
+    accelY = Wire.read()<<8|Wire.read(); //Store middle two bytes into accelY
+    accelZ = Wire.read()<<8|Wire.read(); //Store last two bytes into accelZ
+    processAccelData();}
+void processAccelData(){
+    gForceX = accelX / 16384.0*10;
+    gForceY = accelY / 16384.0*10; 
+    gForceZ = accelZ / 16384.0*10;}
+void recordGyroRegisters() {
+    Wire.beginTransmission(0b1101000); //I2C address of the MPU
+    Wire.write(0x43); //Starting register for Gyro Readings
+    Wire.endTransmission();
+    Wire.requestFrom(0b1101000,6); //Request Gyro Registers (43 - 48)
+    while(Wire.available() < 6);
+    gyroX = Wire.read()<<8|Wire.read(); //Store first two bytes into accelX
+    gyroY = Wire.read()<<8|Wire.read(); //Store middle two bytes into accelY
+    gyroZ = Wire.read()<<8|Wire.read(); //Store last two bytes into accelZ
+    processGyroData();}
+void processGyroData() {
+    rotX = gyroX / 131.0;
+    rotY = gyroY / 131.0; 
+    rotZ = gyroZ / 131.0;}
+void printFloat(double number, int digits){
+  if (number < 0.0) {
+     Serial.print('-');
+     number = -number;}// Round correctly so that print(1.999, 2) prints as "2.00"
+  double rounding = 0.5;
+  for (uint8_t i=0; i<digits; ++i)
+    rounding /= 10.0;
+    number += rounding;// Extract the integer part of the number and print it
+  unsigned long int_part = (unsigned long)number;
+  double remainder = number - (double)int_part;
+  Serial.print(int_part);// Print the decimal point, but only if there are digits beyond
+  if (digits > 0)
+    Serial.print("."); // Extract digits from the remainder one at a time
+  while (digits-- > 0) {
+    remainder *= 10.0;
+    int toPrint = int(remainder);
+    Serial.print(toPrint);
+    remainder -= toPrint;}}
+void gpsdump(TinyGPS &gps){
+  long lat, lon;
+  float flat, flon;
+  unsigned long age, date, time, chars;
+  int year;
+  byte month, day, hour, minute, second, hundredths;
+  unsigned short sentences, failed;
+  gps.get_position(&lat, &lon, &age);
+  Serial.print("Lat/Long(10^-5 deg): "); Serial.print(lat); Serial.print(", "); Serial.print(lon); 
+  Serial.print(" Fix age: "); Serial.print(age); Serial.println("ms.");
+  gps.f_get_position(&flat, &flon, &age);
+  Serial.print("Lat/Long(float): "); printFloat(flat, 5); Serial.print(", "); printFloat(flon, 5);
+    Serial.print(" Fix age: "); Serial.print(age); Serial.println("ms.");
+  gps.get_datetime(&date, &time, &age);
+  Serial.print("Date(ddmmyy): "); Serial.print(date); Serial.print(" Time(hhmmsscc): ");
+    Serial.print(time);
+  Serial.print(" Fix age: "); Serial.print(age); Serial.println("ms.");
+  gps.crack_datetime(&year, &month, &day, &hour, &minute, &second, &hundredths, &age);
+  Serial.print("Date: "); Serial.print(static_cast<int>(month)); Serial.print("/"); 
+    Serial.print(static_cast<int>(day)); Serial.print("/"); Serial.print(year);
+  Serial.print("  Time: "); Serial.print(static_cast<int>(hour+8));  Serial.print(":"); //Serial.print("UTC +08:00 Malaysia");
+    Serial.print(static_cast<int>(minute)); Serial.print(":"); Serial.print(static_cast<int>(second));
+    Serial.print("."); Serial.print(static_cast<int>(hundredths)); Serial.print(" UTC +08:00 Malaysia");
+  Serial.print("  Fix age: ");  Serial.print(age); Serial.println("ms.");
+  Serial.print("Alt(cm): "); Serial.print(gps.altitude()); Serial.print(" Course(10^-2 deg): ");
+    Serial.print(gps.course()); Serial.print(" Speed(10^-2 knots): "); Serial.println(gps.speed());
+  Serial.print("Alt(float): "); printFloat(gps.f_altitude()); Serial.print(" Course(float): ");
+    printFloat(gps.f_course()); Serial.println();
+  Serial.print("Speed(knots): "); printFloat(gps.f_speed_knots()); Serial.print(" (mph): ");
+    printFloat(gps.f_speed_mph());
+  Serial.print(" (mps): "); printFloat(gps.f_speed_mps()); Serial.print(" (kmph): ");
+    printFloat(gps.f_speed_kmph()); Serial.println();
+  gps.stats(&chars, &sentences, &failed);
+  Serial.print("Stats: characters: "); Serial.print(chars); Serial.print(" sentences: ");
+    Serial.print(sentences); Serial.print(" failed checksum: "); Serial.println(failed);}
+void setup_wifi() {
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+  delay(500);
+  Serial.print(".");}
+  Serial.println("");
+  Serial.println(WiFi.macAddress());
+  Serial.println(WiFi.localIP());
+  Serial.println("WiFi connected");}
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+      if (client.connect("esp8266")) {
+      Serial.println("connected");
+      }else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);}}}
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Gps.begin(9600);
+  setupMPU();
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  pinMode(PIN_ANALOG_IN,INPUT);
+  Serial.print("Testing TinyGPS library v. "); Serial.println(TinyGPS::library_version());}
+void loop() {
+  recordAccelRegisters();
+  recordGyroRegisters();
+  long tab[NB_SAMPLE];
+  int i=0;
+  float value;
+  int index_perso = 0;
+  int somme = 0;
+  int moyenne=0;
+  float db=0;
+  String dbstring="";
+  value = analogRead(PIN_ANALOG_IN);
+  db=20*log10(value)+10;
+  dbstring="dB=" + String (db);
+  moyenne=moyenne-tab[index_perso]/NB_SAMPLE;
+  tab[index_perso] = db;
+  moyenne=moyenne+tab[index_perso]/NB_SAMPLE;
+  index_perso = (index_perso +1) % NB_SAMPLE;
+  bool newdata = false;
+  unsigned long start = millis();
+  long lat, lon;
+  float flat, flon;
+  unsigned long age, date, time, chars;
+  int year;
+  byte month, day, hour, minute, second, hundredths;
+  unsigned short sentences, failed;
+  while (millis() - start < 5000) {
+    if (Gps.available()) {
+      char c = Gps.read();
+      //Serial.print(c);  // uncomment to see raw GPS data
+      if (gps.encode(c)) {
+        newdata = true;
+        break;}}}
+  if (newdata) {
+    Serial.println("Acquired Data");
+    Serial.println("-------------");
+    gpsdump(gps);
+    Serial.println("-------------");
+    Serial.println();}
+    
+    String payload = "{";
+      payload += "\"Decibel\": ";
+      payload += db;
+      payload += ",";
+      payload += "\"Velocity\": ";
+      payload += ((sqrt(((rotX * 0.01 )*(rotX * 0.01)) + ((rotY * 0.01)*(rotY * 0.01)) + ((rotZ * 0.01)*(rotZ * 0.01))))/100)-0.03;
+      payload += ",";
+      payload += "\"Mac Ip\": ";
+      payload += "\"84:F3:EB:94:9E:73\"";
+      payload += ",";
+      payload += "\"Lat\": ";
+      payload += lat;
+      payload += ",";
+      payload += "\"Long\": ";
+      payload += lon;
+      payload += ",";
+      payload += "\"Date\": ";
+      payload += day;
+      payload += month;
+      payload += year;
+      payload += ",";
+      payload += "\"Time\": ";
+      payload += hour;
+      payload += minute;
+      payload += second;
+      payload += "}";
+   if (!client.connected()) {
+      reconnect(   );}
+    client.loop();
+    char attributes[100];
+    payload.toCharArray( attributes, 100 );
+    client.publish( "test", attributes );
+    Serial.println( attributes );
+    delay(400);}
